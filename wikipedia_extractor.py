@@ -16,6 +16,7 @@ class ExtractorError(Exception):
     """Base error for the application."""
 
 
+# ----------------------------- core logic -----------------------------
 class WikipediaExtractor:
     """Fetches and extracts selected sections from Wikipedia."""
 
@@ -27,16 +28,13 @@ class WikipediaExtractor:
 
     @staticmethod
     def clean(text):
-        """Remove citation markers like [1] and collapse whitespace."""
         text = re.sub(r"\[\s*\d+\s*\]", "", text)
         return re.sub(r"\s+", " ", text).strip()
 
     def fetch(self, topic):
-        """Fetch and parse an article, then return its title."""
         topic = topic.strip()
         if not topic:
             raise ExtractorError("The topic cannot be empty.")
-
         url = BASE_URL + quote(topic.replace(" ", "_"), safe="_()-',")
         try:
             response = requests.get(
@@ -56,34 +54,27 @@ class WikipediaExtractor:
             soup = BeautifulSoup(response.text, "html.parser")
             if soup.find(id="noarticletext"):
                 raise ExtractorError(f'No Wikipedia article was found for "{topic}".')
-
             heading = soup.find("h1", id="firstHeading") or soup.find("h1")
             content = soup.find("div", id="mw-content-text") or soup.find("main")
             if heading is None or content is None:
                 raise ExtractorError("The page could not be parsed; its structure may have changed.")
-
             self.title = heading.get_text(" ", strip=True)
             self.url = response.url
-            self._list_sections(content)
+            self.sections = []
+            for h2 in content.find_all("h2"):
+                headline = h2.find(class_=re.compile(r"\bmw-headline\b"))
+                text = (headline or h2).get_text(" ", strip=True).replace("[edit]", "").strip()
+                if text:
+                    self.sections.append({"title": text, "heading": h2})
+            if not self.sections:
+                raise ExtractorError("No top-level sections were found in this article.")
         except ExtractorError:
             raise
         except Exception as error:
             raise ExtractorError(f"An unexpected parsing error occurred: {error}") from error
         return self.title
 
-    def _list_sections(self, content):
-        """Store the article's top-level (h2) sections."""
-        self.sections = []
-        for h2 in content.find_all("h2"):
-            headline = h2.find(class_=re.compile(r"\bmw-headline\b"))
-            text = (headline or h2).get_text(" ", strip=True).replace("[edit]", "").strip()
-            if text:
-                self.sections.append({"title": text, "heading": h2})
-        if not self.sections:
-            raise ExtractorError("No top-level sections were found in this article.")
-
     def extract_section(self, index):
-        """Extract headings, paragraphs, lists, and tables from one section."""
         section = self.sections[index]
         next_heading = (
             self.sections[index + 1]["heading"]
@@ -121,13 +112,11 @@ class WikipediaExtractor:
 
 
 def parse_selection(user_input, maximum):
-    """Parse numbers, comma lists, ranges, and 'all' into sorted numbers."""
     text = user_input.strip().lower()
     if not text:
         raise ValueError("Enter at least one section number.")
     if text == "all":
         return list(range(1, maximum + 1))
-
     numbers = []
     for part in text.split(","):
         part = part.strip()
@@ -155,19 +144,7 @@ def parse_selection(user_input, maximum):
     return sorted(set(numbers))
 
 
-def request_selection(maximum):
-    """Keep asking until the user enters a valid selection."""
-    while True:
-        print("\nEnter numbers, commas, ranges, or 'all'.")
-        print("Examples: 1 | 1,3,5 | 2-4 | all")
-        try:
-            return parse_selection(input("Sections to extract: "), maximum)
-        except ValueError as error:
-            print(f"Invalid selection: {error}\nPlease try again.")
-
-
 def build_output(extractor, numbers):
-    """Assemble the structured text file content."""
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     lines = [
         "=" * 70,
@@ -185,25 +162,23 @@ def build_output(extractor, numbers):
     for index, section in enumerate(extractor.sections):
         if index + 1 not in chosen:
             continue
-        lines += [
-            section["title"],
-            "-" * len(section["title"]),
-            extractor.extract_section(index),
-            "",
-        ]
+        lines += [section["title"], "-" * len(section["title"]),
+                  extractor.extract_section(index), ""]
     return "\n".join(lines).strip() + "\n"
 
 
+def safe_filename(title):
+    safe = re.sub(r'[<>:"/\\|?*]', "", title)
+    return re.sub(r"\s+", "_", safe).strip("._")[:120] or "wikipedia_extract"
+
+
 def save_file(content, title):
-    """Save content, using a non-conflicting filename if needed."""
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        safe = re.sub(r'[<>:"/\\|?*]', "", title)
-        safe = re.sub(r"\s+", "_", safe).strip("._")[:120] or "wikipedia_extract"
-        path = OUTPUT_DIR / f"{safe}.txt"
+        path = OUTPUT_DIR / f"{safe_filename(title)}.txt"
         counter = 1
         while path.exists():
-            path = OUTPUT_DIR / f"{safe}_{counter}.txt"
+            path = OUTPUT_DIR / f"{safe_filename(title)}_{counter}.txt"
             counter += 1
         path.write_text(content, encoding="utf-8")
         return path
@@ -211,8 +186,18 @@ def save_file(content, title):
         raise ExtractorError(f"The output file could not be created: {error}") from error
 
 
-def process_article():
-    """Search, extract, and save one article."""
+# --------------------------- console interface ---------------------------
+def console_request_selection(maximum):
+    while True:
+        print("\nEnter numbers, commas, ranges, or 'all'.")
+        print("Examples: 1 | 1,3,5 | 2-4 | all")
+        try:
+            return parse_selection(input("Sections to extract: "), maximum)
+        except ValueError as error:
+            print(f"Invalid selection: {error}\nPlease try again.")
+
+
+def console_process_article():
     extractor = WikipediaExtractor()
     while True:
         topic = input("\nTopic (or Q to go back): ").strip()
@@ -225,15 +210,13 @@ def process_article():
             print(f"Error: {error}")
             if input("Try another topic? (y/n): ").strip().lower() != "y":
                 return
-
     print(f"\nLoaded: {title}")
     print(f"URL: {extractor.url}")
     print("\nAvailable sections:")
     for i, section in enumerate(extractor.sections, start=1):
         print(f"{i}. {section['title']}")
-
     try:
-        numbers = request_selection(len(extractor.sections))
+        numbers = console_request_selection(len(extractor.sections))
         path = save_file(build_output(extractor, numbers), title)
     except ExtractorError as error:
         print(f"Error: {error}")
@@ -241,8 +224,7 @@ def process_article():
     print(f"\nDone. Sections {numbers} saved to: {path.resolve()}")
 
 
-def main():
-    """Run the console application."""
+def run_console():
     print("=" * 60)
     print("WIKIPEDIA SECTION EXTRACTOR")
     print("=" * 60)
@@ -253,12 +235,75 @@ def main():
     while True:
         choice = input("\n1. Extract an article\n2. Exit\nSelect an option: ").strip()
         if choice == "1":
-            process_article()
+            console_process_article()
         elif choice == "2":
             print("\nGoodbye!")
             break
         else:
             print("Invalid option. Enter 1 or 2.")
+
+
+# --------------------------- streamlit interface -------------------------
+def run_streamlit():
+    import streamlit as st
+
+    st.set_page_config(page_title="Wikipedia Section Extractor")
+    st.title("Wikipedia Section Extractor")
+    st.info(
+        "Welcome! This app searches Wikipedia, lists an article's top-level "
+        "sections, lets you choose one or more of them, and lets you download "
+        "the result as a structured text file. To use it: type a topic below "
+        "and click 'Search', then select your section(s) and click 'Extract'."
+    )
+
+    topic = st.text_input("Enter a Wikipedia topic:")
+    if st.button("Search"):
+        extractor = WikipediaExtractor()
+        try:
+            title = extractor.fetch(topic)
+            st.session_state.extractor = extractor
+            st.success(f"Loaded: {title}")
+            st.write(extractor.url)
+        except ExtractorError as error:
+            st.error(str(error))
+
+    if "extractor" in st.session_state:
+        extractor = st.session_state.extractor
+        labels = [s["title"] for s in extractor.sections]
+        chosen = st.multiselect(
+            "Select section(s) to extract:",
+            options=list(range(1, len(labels) + 1)),
+            format_func=lambda n: f"{n}. {labels[n - 1]}",
+        )
+        if st.button("Extract"):
+            if not chosen:
+                st.warning("Please choose at least one section.")
+            else:
+                content = build_output(extractor, chosen)
+                st.text_area("Preview", content, height=300)
+                st.download_button(
+                    "Download .txt",
+                    content,
+                    file_name=f"{safe_filename(extractor.title)}.txt",
+                    mime="text/plain",
+                )
+
+
+# ------------------------------ entry point ------------------------------
+def running_in_streamlit():
+    """True only when launched with `streamlit run`."""
+    try:
+        import streamlit.runtime
+        return streamlit.runtime.exists()
+    except Exception:
+        return False
+
+
+def main():
+    if running_in_streamlit():
+        run_streamlit()
+    else:
+        run_console()
 
 
 if __name__ == "__main__":
